@@ -4,8 +4,8 @@ APP_NAME := util_ack
 
 ### Constant symbols
 
-CC := $(CROSS_COMPILE)gcc
-AR := $(CROSS_COMPILE)ar
+CC := $(CROSS_COMPILE)arm-linux-gnueabihf-gcc
+AR := $(CROSS_COMPILE)arm-linux-gnueabihf-ar
 
 CFLAGS := -O2 -Wall -Wextra -std=c99 -Iinc -I.
 

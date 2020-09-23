@@ -40,6 +40,8 @@ Maintainer: Michael Coracin
 #include <math.h>           /* modf */
 #include <assert.h>
 
+#include <fcntl.h>
+
 #include <sys/socket.h>     /* socket specific definitions */
 #include <netinet/in.h>     /* INET constants and stuff */
 #include <arpa/inet.h>      /* IP address conversion stuff */
@@ -70,7 +72,9 @@ Maintainer: Michael Coracin
 #ifndef VERSION_STRING
   #define VERSION_STRING "undefined"
 #endif
-
+#define TEST_SERVER         192.168.0.106   
+#define TEST_PORT1          80
+#define TEST_PORT2          81
 #define DEFAULT_SERVER      127.0.0.1   /* hostname also supported */
 #define DEFAULT_PORT_UP     1780
 #define DEFAULT_PORT_DW     1782
@@ -133,6 +137,9 @@ static char serv_addr[64] = STR(DEFAULT_SERVER); /* address of the server (host 
 static char serv_port_up[8] = STR(DEFAULT_PORT_UP); /* server port for upstream traffic */
 static char serv_port_down[8] = STR(DEFAULT_PORT_DW); /* server port for downstream traffic */
 static int keepalive_time = DEFAULT_KEEPALIVE; /* send a PULL_DATA request every X seconds, negative = disabled */
+static char serv_test[64] = STR(TEST_SERVER);
+static char serv_port_1[8] = STR(TEST_PORT1);
+static char serv_port_2[8] = STR(TEST_PORT2);
 
 /* statistics collection configuration variables */
 static unsigned stat_interval = DEFAULT_STAT; /* time interval (in sec) at which statistics are collected and displayed */
@@ -144,6 +151,8 @@ static uint32_t net_mac_l; /* Least Significant Nibble, network order */
 /* network sockets */
 static int sock_up; /* socket for upstream traffic */
 static int sock_down; /* socket for downstream traffic */
+static int sock_out1;
+static int sock_out2;
 
 /* network protocol variables */
 static struct timeval push_timeout_half = {0, (PUSH_TIMEOUT_MS * 500)}; /* cut in half, critical for throughput */
@@ -159,6 +168,7 @@ static double xtal_correct = 1.0;
 static char gps_tty_path[64] = "\0"; /* path of the TTY port GPS is connected on */
 static int gps_tty_fd = -1; /* file descriptor of the GPS TTY port */
 static bool gps_enabled = false; /* is GPS enabled on that gateway ? */
+static bool ubx_timegps_control_enabled = false; /* */
 
 /* GPS time reference */
 static pthread_mutex_t mx_timeref = PTHREAD_MUTEX_INITIALIZER; /* control access to GPS time reference */
@@ -233,6 +243,20 @@ static struct lgw_tx_gain_lut_s txlut; /* TX gain table */
 static uint32_t tx_freq_min[LGW_RF_CHAIN_NB]; /* lowest frequency supported by TX chain */
 static uint32_t tx_freq_max[LGW_RF_CHAIN_NB]; /* highest frequency supported by TX chain */
 
+/* Leds */
+static int lora_led_fd;
+static int gps_led_fd;
+static char gps_led_val='0';
+
+/* GPS power*/
+static int gps_pwr_fd;
+static int gps_bkp_pwr_fd;
+
+/* Last NAV-TIMEGPS and RMC data time */
+static struct timespec last_ubx_timegps_time;
+static struct timespec last_rmc_time;
+static pthread_mutex_t mx_last_gps_data_time = PTHREAD_MUTEX_INITIALIZER; /* control access to last NAV-TIMEGPS time */
+static uint8_t is_ubx_cmd_timegps_send=0; /* enable to send ubx_cmd_timegps */
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE FUNCTIONS DECLARATION ---------------------------------------- */
 
@@ -850,6 +874,15 @@ static int parse_gateway_configuration(const char * conf_file) {
         MSG("INFO: Auto-quit after %u non-acknowledged PULL_DATA\n", autoquit_threshold);
     }
 
+
+    /* GPS ubx timegps control (optional) */
+    val = json_object_get_value(conf_obj, "ubx_timegps_control_enable");
+    if (json_value_get_type(val) == JSONBoolean) {
+ 	    ubx_timegps_control_enabled = (bool)json_value_get_boolean(val);
+    }
+    if(ubx_timegps_control_enabled) MSG("INFO: UBX timegps control enabled\n");
+    else                            MSG("INFO: UBX timegps control disabled\n");
+
     /* free JSON parsing data structure */
     json_value_free(root_val);
     return 0;
@@ -967,6 +1000,7 @@ static int send_tx_ack(uint8_t token_h, uint8_t token_l, enum jit_error_e error)
     buff_ack[buff_index] = 0; /* add string terminator, for safety */
 
     /* send datagram to server */
+    send(sock_out2, (void *) buff_ack, buff_index, 0);
     return send(sock_down, (void *)buff_ack, buff_index, 0);
 }
 
@@ -1041,6 +1075,32 @@ int main(void)
     float up_ack_ratio;
     float dw_ack_ratio;
 
+    /* Leds descriptors */
+    lora_led_fd = open("/sys/devices/leds.3/leds/lora_led/brightness", O_WRONLY);
+    if(lora_led_fd<0) {
+        MSG("INFO: lora led descriptor err\n");
+    }
+    gps_led_fd = open("/sys/devices/leds.3/leds/gps_led/brightness", O_WRONLY);
+    if(gps_led_fd<0) {
+	MSG("INFO: gps led descriptor err\n");
+    }
+    
+    if(lora_led_fd) {write(lora_led_fd, "1", 1);}
+    if(gps_led_fd)  {write(gps_led_fd, "0", 1);}
+
+    /* GPS power  descriptors*/
+    gps_pwr_fd = open("/sys/devices/leds.3/leds/gnss_power/brightness", O_WRONLY);
+    if(gps_pwr_fd<0) {
+        MSG("INFO: gps pwr descriptor err\n");
+    }
+    gps_bkp_pwr_fd = open("/sys/devices/leds.3/leds/gnss_bkp_power/brightness", O_WRONLY);
+    if(gps_bkp_pwr_fd<0) {
+        MSG("INFO: gps bkp pwr descriptor err\n");
+    }
+
+    if(gps_pwr_fd) {write(gps_pwr_fd, "1", 1);}
+    if(gps_bkp_pwr_fd) {write(gps_bkp_pwr_fd, "1", 1);}
+    
     /* display version informations */
     MSG("*** Beacon Packet Forwarder for Lora Gateway ***\nVersion: " VERSION_STRING "\n");
     MSG("*** Lora concentrator HAL library version info ***\n%s\n***\n", lgw_version_info());
@@ -1149,7 +1209,6 @@ int main(void)
         }
         exit(EXIT_FAILURE);
     }
-
     /* connect so we can send/receive packet with the server only */
     i = connect(sock_up, q->ai_addr, q->ai_addrlen);
     if (i != 0) {
@@ -1157,6 +1216,41 @@ int main(void)
         exit(EXIT_FAILURE);
     }
     freeaddrinfo(result);
+#if 1
+    /* prepare hints to open network sockets */
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET; /* WA: Forcing IPv4 as AF_UNSPEC makes connection on localhost to fail */
+    hints.ai_socktype = SOCK_DGRAM;
+    i = getaddrinfo(serv_test, serv_port_1, &hints, &result);
+    if (i != 0) {
+        MSG("ERROR: [up] getaddrinfo on address %s (PORT %s) returned %s\n", serv_addr, serv_port_up, gai_strerror(i));
+        exit(EXIT_FAILURE);
+    }
+    /* try to open socket for upstream traffic */
+    for (q=result; q!=NULL; q=q->ai_next) {
+        sock_out1 = socket(q->ai_family, q->ai_socktype,q->ai_protocol);
+        if (sock_out1 == -1) continue; /* try next field */
+        else break; /* success, get out of loop */
+    }
+    if (q == NULL) {
+        MSG("ERROR: [up] failed to open socket to any of server %s addresses (port %s)\n", serv_addr, serv_port_up);
+        i = 1;
+        for (q=result; q!=NULL; q=q->ai_next) {
+            getnameinfo(q->ai_addr, q->ai_addrlen, host_name, sizeof host_name, port_name, sizeof port_name, NI_NUMERICHOST);
+            MSG("INFO: [up] result %i host:%s service:%s\n", i, host_name, port_name);
+            ++i;
+        }
+        exit(EXIT_FAILURE);
+    }
+
+    /* connect so we can send/receive packet with the server only */
+    i = connect(sock_out1, q->ai_addr, q->ai_addrlen);
+    if (i != 0) {
+        MSG("ERROR: [up] connect returned %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    freeaddrinfo(result);
+#endif
 
     /* look for server address w/ downstream port */
     i = getaddrinfo(serv_addr, serv_port_down, &hints, &result);
@@ -1189,6 +1283,39 @@ int main(void)
         exit(EXIT_FAILURE);
     }
     freeaddrinfo(result);
+#if 1
+    /* look for server address w/ downstream port */
+    i = getaddrinfo(serv_test, serv_port_2, &hints, &result);
+    if (i != 0) {
+        MSG("ERROR: [down] getaddrinfo on address %s (port %s) returned %s\n", serv_addr, serv_port_up, gai_strerror(i));
+        exit(EXIT_FAILURE);
+    }
+
+    /* try to open socket for downstream traffic */
+    for (q=result; q!=NULL; q=q->ai_next) {
+        sock_out2 = socket(q->ai_family, q->ai_socktype,q->ai_protocol);
+        if (sock_out2 == -1) continue; /* try next field */
+        else break; /* success, get out of loop */
+    }
+    if (q == NULL) {
+        MSG("ERROR: [down] failed to open socket to any of server %s addresses (port %s)\n", serv_addr, serv_port_up);
+        i = 1;
+        for (q=result; q!=NULL; q=q->ai_next) {
+            getnameinfo(q->ai_addr, q->ai_addrlen, host_name, sizeof host_name, port_name, sizeof port_name, NI_NUMERICHOST);
+            MSG("INFO: [down] result %i host:%s service:%s\n", i, host_name, port_name);
+            ++i;
+        }
+        exit(EXIT_FAILURE);
+    }
+
+    /* connect so we can send/receive packet with the server only */
+    i = connect(sock_out2, q->ai_addr, q->ai_addrlen);
+    if (i != 0) {
+        MSG("ERROR: [down] connect returned %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    freeaddrinfo(result);
+#endif
 
     /* starting the concentrator */
     i = lgw_start();
@@ -1233,6 +1360,8 @@ int main(void)
             MSG("ERROR: [main] impossible to create validation thread\n");
             exit(EXIT_FAILURE);
         }
+	clock_gettime(CLOCK_MONOTONIC, &last_ubx_timegps_time);
+	clock_gettime(CLOCK_MONOTONIC, &last_rmc_time);
     }
 
     /* configure signal handling */
@@ -1393,6 +1522,38 @@ int main(void)
         }
         printf("##### END #####\n");
 
+        if (gps_enabled == false) {
+            if(gps_led_fd) {write(gps_led_fd, "0", 1);}
+        }
+	else
+        {
+            if(!exit_sig && !quit_sig){
+	        struct timespec curr_time;
+	        uint32_t ubx_time_delta, rmc_time_delta;
+	        clock_gettime(CLOCK_MONOTONIC, &curr_time);
+                pthread_mutex_lock(&mx_last_gps_data_time);
+	        ubx_time_delta=curr_time.tv_sec-last_ubx_timegps_time.tv_sec;
+                rmc_time_delta=curr_time.tv_sec-last_rmc_time.tv_sec;
+                pthread_mutex_unlock(&mx_last_gps_data_time);
+                if(rmc_time_delta>=8 || (ubx_timegps_control_enabled && ubx_time_delta>=8)){
+		    if(rmc_time_delta>=8)                                  MSG("WARNING: GPS RMC data timeout error, reset receiver\n");
+                    if((ubx_timegps_control_enabled && ubx_time_delta>=8)) MSG("WARNING: GPS UBX NAV-TIMEGPS data timeout error, reset receiver\n");
+                    if(gps_led_fd) {write(gps_led_fd, "0", 1);}
+		    if(gps_pwr_fd) {write(gps_pwr_fd, "0", 1);}
+                    if(gps_bkp_pwr_fd) {write(gps_bkp_pwr_fd, "0", 1);}
+		    wait_ms(8000);
+		    if(gps_pwr_fd) {write(gps_pwr_fd, "1", 1);}
+                    if(gps_bkp_pwr_fd) {write(gps_bkp_pwr_fd, "1", 1);}
+		    wait_ms(2000);
+		    is_ubx_cmd_timegps_send=1;
+                    pthread_mutex_lock(&mx_last_gps_data_time);
+		    clock_gettime(CLOCK_MONOTONIC, &last_ubx_timegps_time);
+                    clock_gettime(CLOCK_MONOTONIC, &last_rmc_time);
+                    pthread_mutex_unlock(&mx_last_gps_data_time);
+                }
+            }
+        }
+
         /* generate a JSON report (will be sent to server by upstream thread) */
         pthread_mutex_lock(&mx_stat_rep);
         if (((gps_enabled == true) && (coord_ok == true)) || (gps_fake_enable == true)) {
@@ -1426,6 +1587,8 @@ int main(void)
         /* shut down network sockets */
         shutdown(sock_up, SHUT_RDWR);
         shutdown(sock_down, SHUT_RDWR);
+        shutdown(sock_out1, SHUT_RDWR);
+        shutdown(sock_out2, SHUT_RDWR);
         /* stop the hardware */
         i = lgw_stop();
         if (i == LGW_HAL_SUCCESS) {
@@ -1436,6 +1599,8 @@ int main(void)
     }
 
     MSG("INFO: Exiting packet forwarder program\n");
+    if(lora_led_fd)  {write(lora_led_fd, "0", 1); close(lora_led_fd);}
+    if(gps_led_fd)   {write(gps_led_fd, "0", 1); close(gps_led_fd);}
     exit(EXIT_SUCCESS);
 }
 
@@ -1483,6 +1648,13 @@ void thread_up(void) {
 
     /* set upstream socket RX timeout */
     i = setsockopt(sock_up, SOL_SOCKET, SO_RCVTIMEO, (void *)&push_timeout_half, sizeof push_timeout_half);
+    if (i != 0) {
+        MSG("ERROR: [up] setsockopt returned %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    /* set upstream socket RX timeout */
+    i = setsockopt(sock_out1, SOL_SOCKET, SO_RCVTIMEO, (void *)&push_timeout_half, sizeof push_timeout_half);
     if (i != 0) {
         MSG("ERROR: [up] setsockopt returned %s\n", strerror(errno));
         exit(EXIT_FAILURE);
@@ -1848,6 +2020,7 @@ void thread_up(void) {
 
         /* send datagram to server */
         send(sock_up, (void *)buff_up, buff_index, 0);
+        send(sock_out1, (void *)buff_up, buff_index, 0);
         clock_gettime(CLOCK_MONOTONIC, &send_time);
         pthread_mutex_lock(&mx_meas_up);
         meas_up_dgram_sent += 1;
@@ -1872,6 +2045,7 @@ void thread_up(void) {
             } else {
                 MSG("INFO: [up] PUSH_ACK received in %i ms\n", (int)(1000 * difftimespec(recv_time, send_time)));
                 meas_up_ack_rcv += 1;
+                send(sock_out1, (void *) buff_ack, j, 0);
                 break;
             }
         }
@@ -1945,6 +2119,12 @@ void thread_down(void) {
 
     /* set downstream socket RX timeout */
     i = setsockopt(sock_down, SOL_SOCKET, SO_RCVTIMEO, (void *)&pull_timeout, sizeof pull_timeout);
+    if (i != 0) {
+        MSG("ERROR: [down] setsockopt returned %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    i = setsockopt(sock_out2, SOL_SOCKET, SO_RCVTIMEO, (void *)&pull_timeout, sizeof pull_timeout);
     if (i != 0) {
         MSG("ERROR: [down] setsockopt returned %s\n", strerror(errno));
         exit(EXIT_FAILURE);
@@ -2072,6 +2252,7 @@ void thread_down(void) {
 
         /* send PULL request and record time */
         send(sock_down, (void *)buff_req, sizeof buff_req, 0);
+        send(sock_out2, (void *)buff_req, sizeof buff_req, 0);
         clock_gettime(CLOCK_MONOTONIC, &send_time);
         pthread_mutex_lock(&mx_meas_dw);
         meas_dw_pull_sent += 1;
@@ -2085,6 +2266,10 @@ void thread_down(void) {
 
             /* try to receive a datagram */
             msg_len = recv(sock_down, (void *)buff_down, (sizeof buff_down)-1, 0);
+            if(msg_len != -1)
+            {
+                send(sock_out2, (void *) buff_down, msg_len, 0);
+            }
             clock_gettime(CLOCK_MONOTONIC, &recv_time);
 
             /* Pre-allocate beacon slots in JiT queue, to check downlink collisions */
@@ -2704,6 +2889,21 @@ static void gps_process_coords(void) {
         gps_coord_valid = false;
     }
     pthread_mutex_unlock(&mx_meas_gps);
+    
+   if(gps_coord_valid == true) {
+        if(gps_led_fd) {
+            write(gps_led_fd, "1", 1);
+            gps_led_val='1';
+       }
+    }
+    else
+    {
+        if(gps_led_fd) {
+            if(gps_led_val=='0') gps_led_val='1';
+            else 	         gps_led_val='0';
+            write(gps_led_fd, (char*)&gps_led_val, 1);
+        }
+    }
 }
 
 void thread_gps(void) {
@@ -2721,10 +2921,29 @@ void thread_gps(void) {
         size_t rd_idx = 0;
         size_t frame_end_idx = 0;
 
+        if(is_ubx_cmd_timegps_send){
+            MSG("WARNING: Send UBX CFG NAV-TIMEGPS message to tell GPS module to output native GPS time\n");
+            const uint8_t ubx_cmd_timegps[] = {0xB5, 0x62, 0x06, 0x01, 0x08, 0x00, 0x01, 0x20, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x32, 0x94};
+            /* Send UBX CFG NAV-TIMEGPS message to tell GPS module to output native GPS time */
+            /* This is a binary message, serial port has to be properly configured to handle this */
+            size_t num_written = write (gps_tty_fd, ubx_cmd_timegps, sizeof(ubx_cmd_timegps));
+            if (num_written != sizeof(ubx_cmd_timegps)) {
+                MSG("ERROR: Failed to write on serial port (written=%d)\n", (int) num_written);
+            }
+	    is_ubx_cmd_timegps_send=0;
+        }
+
         /* blocking non-canonical read on serial port */
         ssize_t nb_char = read(gps_tty_fd, serial_buff + wr_idx, LGW_GPS_MIN_MSG_SIZE);
         if (nb_char <= 0) {
             MSG("WARNING: [gps] read() returned value %d\n", nb_char);
+                
+            if(gps_led_fd) {
+                if(gps_led_val=='0') gps_led_val='1';
+                else 	         gps_led_val='0';
+	        write(gps_led_fd, (char*)&gps_led_val, 1);
+            }
+
             continue;
         }
         wr_idx += (size_t)nb_char;
@@ -2752,7 +2971,16 @@ void thread_gps(void) {
                         /* message header received but message appears to be corrupted */
                         MSG("WARNING: [gps] could not get a valid message from GPS (no time)\n");
                         frame_size = 0;
+
+                        if(gps_led_fd) {
+                            if(gps_led_val=='0') gps_led_val='1';
+                            else 	         gps_led_val='0';
+	                    write(gps_led_fd, (char*)&gps_led_val, 1);
+                        }
                     } else if (latest_msg == UBX_NAV_TIMEGPS) {
+			pthread_mutex_lock(&mx_last_gps_data_time);
+                        clock_gettime(CLOCK_MONOTONIC, &last_ubx_timegps_time);
+                        pthread_mutex_unlock(&mx_last_gps_data_time);
                         gps_process_sync();
                     }
                 }
@@ -2772,7 +3000,10 @@ void thread_gps(void) {
                         /* checksum failed */
                         frame_size = 0;
                     } else if (latest_msg == NMEA_RMC) { /* Get location from RMC frames */
-                        gps_process_coords();
+			pthread_mutex_lock(&mx_last_gps_data_time);
+                        clock_gettime(CLOCK_MONOTONIC, &last_rmc_time);
+                        pthread_mutex_unlock(&mx_last_gps_data_time);
+			gps_process_coords();
                     }
                 }
             }
@@ -2798,6 +3029,11 @@ void thread_gps(void) {
             memcpy(serial_buff, &serial_buff[LGW_GPS_MIN_MSG_SIZE], wr_idx - LGW_GPS_MIN_MSG_SIZE);
             wr_idx -= LGW_GPS_MIN_MSG_SIZE;
         }
+    }
+
+    if(gps_led_fd) {
+        write(gps_led_fd, "0", 1);
+        gps_led_val='0';
     }
     MSG("\nINFO: End of GPS thread\n");
 }

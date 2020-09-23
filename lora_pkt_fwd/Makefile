@@ -6,7 +6,7 @@ APP_NAME := lora_pkt_fwd
 
 LGW_PATH ?= ../../lora_gateway/libloragw
 ARCH ?=
-CROSS_COMPILE ?=
+CROSS_COMPILE = /home/dho/Desktop/gcc-linaro-arm-linux-gnueabihf-4.7-2013.01-20130125_linux/bin/
 
 OBJDIR = obj
 INCLUDES = $(wildcard inc/*.h)
@@ -19,8 +19,8 @@ RELEASE_VERSION := `cat ../VERSION`
 
 ### Constant symbols
 
-CC := $(CROSS_COMPILE)gcc
-AR := $(CROSS_COMPILE)ar
+CC := $(CROSS_COMPILE)arm-linux-gnueabihf-gcc
+AR := $(CROSS_COMPILE)arm-linux-gnueabihf-ar
 
 CFLAGS := -O2 -Wall -Wextra -std=c99 -Iinc -I.
 VFLAG := -D VERSION_STRING="\"$(RELEASE_VERSION)\""
